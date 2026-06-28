@@ -109,7 +109,7 @@ Decision Gate (3 conditions must ALL pass)
 compliance-query-triage-agent/
 ├── support-ticket-triage-rag-workflow.json   # n8n workflow — import this
 ├── Customer Banking FAQ Policy Document.xlsx  # Knowledge base
-├── AI_PM_mini_PRD_completed.pdf              # Product spec and governance design
+├── Compliance Query Triage Agent PRD.pdf              # Product spec and governance design
 ├── canvas-screenshot.jpg                      # n8n workflow canvas
 └── README.md
 ```
