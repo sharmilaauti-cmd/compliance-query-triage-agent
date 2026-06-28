@@ -98,7 +98,7 @@ Decision Gate (3 conditions must ALL pass)
 |---|---|
 | `How do I set up direct deposit?` | Auto-resolve |
 | `How do I open a savings account?` | Auto-resolve (semantic match) |
-| `I want to report suspected money laundering activity on my account` | Human review (out of scope + high risk) |
+| `I want to report suspected money laundering activity on my account and need to speak to your compliance team urgently` | Human review (out of scope + high risk) |
 | `What is my interest rate for savings account?` | Human review (not in FAQ) |
 
 ---
