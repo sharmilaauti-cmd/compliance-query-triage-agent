@@ -1,0 +1,385 @@
+{
+  "name": "Support Ticket Triage - RAG + Human Review",
+  "nodes": [
+    {
+      "id": "form-trigger",
+      "name": "Support Query Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [0, 300],
+      "parameters": {
+        "formTitle": "Banking Support Query",
+        "formDescription": "Type your banking query below. The AI will classify it, draft a response from our policy document, and route it for review if needed.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "query",
+              "fieldType": "textarea",
+              "requiredField": true,
+              "placeholder": "e.g. My card payment has been pending for 3 days — is this normal?"
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "formResponseText": "Thank you — your query has been received and is being processed."
+      },
+      "notes": "Open the Production URL on this node to submit a query. The workflow fires on each submission."
+    },
+    {
+      "id": "read-faq-sheet",
+      "name": "Read FAQ Policy Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [250, 300],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "mode": "list",
+          "value": ""
+        }
+      },
+      "notes": "Attach Google credential. Pick your spreadsheet and the sheet tab named 'Customer Banking FAQ Policy Doc'."
+    },
+    {
+      "id": "aggregate-faq",
+      "name": "Format FAQ Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ticket = $('Support Query Form').first().json;\nconst faqLines = items\n  .filter(item => item.json.Question && item.json.Answer)\n  .map(item => `Q: ${item.json.Question}\\nA: ${item.json.Answer}`)\n  .join('\\n\\n');\nreturn [{ json: { query: ticket.query, requestId: String(Date.now()), receivedAt: new Date().toISOString(), faqContext: faqLines } }];"
+      },
+      "notes": "Aggregates FAQ rows into one context string and attaches query + requestId + receivedAt."
+    },
+    {
+      "id": "classify-draft",
+      "name": "Classify & Draft Response",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.6,
+      "position": [1050, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a compliance query assistant for a retail bank. Use ONLY the policy document below to answer the customer query. Do not guess or add information not in the policy.\n\nPOLICY DOCUMENT:\n{{ $json.faqContext }}\n\nCUSTOMER QUERY:\n{{ $json.query }}\n\nMatching instructions:\n- Match the customer query to a policy entry based on MEANING and INTENT, not exact wording. A query like 'how do I open savings account' should match 'How do I open a checking or savings account?' because the intent is the same.\n- Only set source_used to 'none' if no policy entry is relevant to the query topic at all.\n\nReturn:\n- category: one of payments, account_access, kyc, card_services, fees, complaint, other\n- draft_response: a clear, compliant reply to the customer citing the relevant policy. If no policy entry matches, set this to exactly: \"This query requires human review as it falls outside our current policy document scope.\"\n- source_used: the exact Question text from the policy doc you used. If truly no entry matches, set this to exactly: \"none\"",
+        "hasOutputParser": true
+      },
+      "notes": "Step 2+3: classifies the query and drafts a response grounded in the FAQ policy sheet."
+    },
+    {
+      "id": "chat-model-1",
+      "name": "Chat Model (Classify+Draft)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [950, 520],
+      "parameters": {
+        "model": {
+          "value": "gpt-4o-mini"
+        }
+      },
+      "notes": "Attach your OpenAI credential here."
+    },
+    {
+      "id": "output-parser-1",
+      "name": "Output Parser (Classify+Draft)",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [1150, 520],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"category\":{\"type\":\"string\"},\"draft_response\":{\"type\":\"string\"},\"source_used\":{\"type\":\"string\"}},\"required\":[\"category\",\"draft_response\",\"source_used\"]}"
+      }
+    },
+    {
+      "id": "score-confidence",
+      "name": "Score Confidence & Risk",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.6,
+      "position": [1400, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a compliance risk reviewer (LLM-as-judge). Evaluate the draft response below and score it.\n\nORIGINAL QUERY: {{ $json.query }}\nCATEGORY: {{ $json.category }}\nDRAFT RESPONSE: {{ $json.draft_response }}\nSOURCE USED: {{ $json.source_used }}\n\nScoring rules:\n- If SOURCE USED is not 'none', the answer is directly grounded in our policy document. Score confidence 4 or 5 unless the draft contains a factual error or contradicts the source.\n- If SOURCE USED is 'none', the answer is not grounded. Score confidence 1 or 2.\n- risk_flag should be 'high' only if the query explicitly involves fraud, disputed transactions, KYC failures, complaints, or legal threats. Routine account, payment, or product queries are 'low'.\n- Do not add uncertainty or caveats simply because the topic is banking. Score based on grounding and factual accuracy only.\n\nReturn:\n- confidence_score: integer 1-5\n- risk_flag: one of low, medium, high\n- risk_category: short label (e.g. 'fraud', 'kyc', 'complaint', 'routine', 'product_info')\n- reasoning: one sentence explaining your scores",
+        "hasOutputParser": true
+      },
+      "notes": "Step 4: LLM-as-judge rates confidence 1-5 and flags risk level."
+    },
+    {
+      "id": "chat-model-2",
+      "name": "Chat Model (Score)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [1300, 520],
+      "parameters": {
+        "model": {
+          "value": "gpt-4o-mini"
+        }
+      },
+      "notes": "Attach your OpenAI credential here."
+    },
+    {
+      "id": "output-parser-2",
+      "name": "Output Parser (Score)",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [1500, 520],
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"confidence_score\":{\"type\":\"number\"},\"risk_flag\":{\"type\":\"string\"},\"risk_category\":{\"type\":\"string\"},\"reasoning\":{\"type\":\"string\"}},\"required\":[\"confidence_score\",\"risk_flag\",\"risk_category\",\"reasoning\"]}"
+      }
+    },
+    {
+      "id": "merge-all-fields",
+      "name": "Merge All Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const form = $('Support Query Form').first().json;\nconst faq = $('Format FAQ Context').first().json;\nconst classifiedRaw = $('Classify & Draft Response').first().json;\nconst classified = classifiedRaw.output || classifiedRaw;\nconst scoredRaw = $input.first().json;\nconst scored = scoredRaw.output || scoredRaw;\n\nreturn [{ json: {\n  requestId: faq.requestId,\n  receivedAt: faq.receivedAt,\n  query: form.query,\n  category: classified.category,\n  draft_response: classified.draft_response,\n  source_used: classified.source_used,\n  confidence_score: Number(scored.confidence_score),\n  risk_flag: scored.risk_flag,\n  risk_category: scored.risk_category,\n  reasoning: scored.reasoning\n} }];"
+      },
+      "notes": "Collects fields from all upstream nodes into one flat item."
+    },
+    {
+      "id": "decision-gate",
+      "name": "Auto-Send or Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1950, 300],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.confidence_score }}",
+              "rightValue": 3,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "leftValue": "={{ $json.risk_flag }}",
+              "rightValue": "low",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{ $json.source_used }}",
+              "rightValue": "none",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "TRUE = confidence >= 3 AND risk = low AND source_used != none → auto-send. FALSE → human review."
+    },
+    {
+      "id": "auto-resolve",
+      "name": "Set Auto-Resolve Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 150],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: { ...item, branch: 'auto_resolved', finalStatus: 'resolved' } }];"
+      },
+      "notes": "Step 6a: adds branch + finalStatus while keeping all other fields intact."
+    },
+    {
+      "id": "set-review-branch",
+      "name": "Set Human Review Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 450],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: { ...item, branch: 'human_review', finalStatus: 'pending_review', review_status: 'pending', reviewer_action: '', reviewer_notes: '' } }];"
+      },
+      "notes": "Step 6b: adds branch + finalStatus + review columns while keeping all other fields intact."
+    },
+    {
+      "id": "human-review-queue",
+      "name": "Add to Human Review Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2450, 450],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "mode": "list",
+          "value": ""
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        }
+      },
+      "notes": "Attach Google credential. Pick 'Pending Review' sheet tab. Headers in row 1: requestId, receivedAt, query, category, draft_response, source_used, confidence_score, risk_flag, risk_category, reasoning, branch, finalStatus, review_status, reviewer_action, reviewer_notes"
+    },
+    {
+      "id": "audit-log",
+      "name": "Log to Audit Trail",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2700, 300],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "mode": "list",
+          "value": ""
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        }
+      },
+      "notes": "Attach Google credential. Pick 'Audit Log' sheet tab. Headers in row 1: requestId, receivedAt, query, category, draft_response, source_used, confidence_score, risk_flag, risk_category, reasoning, branch, finalStatus"
+    },
+    {
+      "id": "note-credentials",
+      "name": "Setup Checklist",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, 600],
+      "parameters": {
+        "content": "## Setup Checklist\n1. **OpenAI credential** → attach to both Chat Model nodes\n2. **Google credential** → attach to Read FAQ Sheet, Human Review Queue, Audit Log\n3. **Read FAQ Sheet** → pick your spreadsheet + sheet tab 'Customer Banking FAQ Policy Doc'\n4. **Human Review Queue** → pick same spreadsheet + sheet tab 'Pending Review'\n5. **Audit Log** → pick same spreadsheet + sheet tab 'Audit Log'\n6. **To submit a query**: activate workflow → open Production URL from Support Query Form node\n7. Test: 'How do I open a checking account?' (→ auto-resolve), 'I think my account was accessed without my permission' (→ human review)",
+        "height": 200,
+        "width": 500,
+        "color": 4
+      }
+    }
+  ],
+  "connections": {
+    "Support Query Form": {
+      "main": [
+        [
+          { "node": "Read FAQ Policy Sheet", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Read FAQ Policy Sheet": {
+      "main": [
+        [
+          { "node": "Format FAQ Context", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Format FAQ Context": {
+      "main": [
+        [
+          { "node": "Classify & Draft Response", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Chat Model (Classify+Draft)": {
+      "ai_languageModel": [
+        [
+          { "node": "Classify & Draft Response", "type": "ai_languageModel", "index": 0 }
+        ]
+      ]
+    },
+    "Output Parser (Classify+Draft)": {
+      "ai_outputParser": [
+        [
+          { "node": "Classify & Draft Response", "type": "ai_outputParser", "index": 0 }
+        ]
+      ]
+    },
+    "Classify & Draft Response": {
+      "main": [
+        [
+          { "node": "Score Confidence & Risk", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Chat Model (Score)": {
+      "ai_languageModel": [
+        [
+          { "node": "Score Confidence & Risk", "type": "ai_languageModel", "index": 0 }
+        ]
+      ]
+    },
+    "Output Parser (Score)": {
+      "ai_outputParser": [
+        [
+          { "node": "Score Confidence & Risk", "type": "ai_outputParser", "index": 0 }
+        ]
+      ]
+    },
+    "Score Confidence & Risk": {
+      "main": [
+        [
+          { "node": "Merge All Fields", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Merge All Fields": {
+      "main": [
+        [
+          { "node": "Auto-Send or Human Review?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Auto-Send or Human Review?": {
+      "main": [
+        [
+          { "node": "Set Auto-Resolve Fields", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Set Human Review Fields", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Set Auto-Resolve Fields": {
+      "main": [
+        [
+          { "node": "Log to Audit Trail", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Set Human Review Fields": {
+      "main": [
+        [
+          { "node": "Add to Human Review Queue", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Add to Human Review Queue": {
+      "main": [
+        [
+          { "node": "Log to Audit Trail", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "support-ticket-triage-rag-v3"
+  }
+}
